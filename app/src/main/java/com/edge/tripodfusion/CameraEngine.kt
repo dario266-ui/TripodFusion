@@ -417,7 +417,7 @@ class CameraEngine(private val context: Context) {
         val ccm = FloatArray(9)
         if (transform != null) {
             val rats = Array(9) { Rational(0, 1) }
-            transform.copyTo(rats, 0)
+            transform.copyElements(rats, 0)
             for (i in 0 until 9) {
                 ccm[i] = if (rats[i].denominator != 0) rats[i].toFloat() else 0f
             }

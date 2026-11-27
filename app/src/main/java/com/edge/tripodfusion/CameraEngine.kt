@@ -51,7 +51,7 @@ data class CapturedRawFrame(
     val buffer: ByteBuffer,
     val exposureNs: Long,
     val iso: Int,
-    val frameType: Int, // 0 = FAST, 1 = LONG
+    val frameType: Int,
     val blackLevels: FloatArray,
     val wbGains: FloatArray,
     val ccm: FloatArray
@@ -70,6 +70,8 @@ class CameraEngine(private val context: Context) {
     private var rawReader: ImageReader? = null
 
     var currentLens: LensInfo? = null
+        private set
+    var probeSummary: String = ""
         private set
 
     private var currentZoomCrop = 1.0f
@@ -98,33 +100,47 @@ class CameraEngine(private val context: Context) {
 
     fun discoverRawLenses(): List<LensInfo> {
         val rawCandidates = mutableListOf<Pair<String, String?>>()
-        val seenKeys = HashSet<String>()
+        val seenIds = HashSet<String>()
+        val probeLog = StringBuilder()
 
-        for (id in cameraManager.cameraIdList) {
-            val chars = cameraManager.getCameraCharacteristics(id)
-            if (chars.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) continue
-            val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: continue
-            if (caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW)) {
-                if (seenKeys.add(id)) rawCandidates.add(id to null)
+        val idsToProbe = LinkedHashSet<String>()
+        idsToProbe.addAll(cameraManager.cameraIdList)
+        for (n in 0..63) idsToProbe.add(n.toString())
+        for (n in 100..105) idsToProbe.add(n.toString())
+
+        for (id in idsToProbe) {
+            val chars = try {
+                cameraManager.getCameraCharacteristics(id)
+            } catch (_: Throwable) {
+                continue
             }
+            if (chars.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) continue
+
+            val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val rawSizes = map?.getOutputSizes(ImageFormat.RAW_SENSOR)
+            val foc = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 0f
+            val hasRaw = rawSizes != null && rawSizes.isNotEmpty()
+            probeLog.append("id$id:${String.format("%.1f", foc)}mm${if (hasRaw) "*" else ""} ")
+
+            if (hasRaw && seenIds.add(id)) {
+                rawCandidates.add(id to null)
+            }
+
             for (physId in chars.physicalCameraIds) {
-                if (!seenKeys.add(physId)) continue
+                if (!seenIds.add(physId)) continue
                 val pChars = try {
                     cameraManager.getCameraCharacteristics(physId)
                 } catch (_: Throwable) {
                     continue
                 }
-                val pCaps = pChars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: continue
-                if (pCaps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW)) {
-                    // Prefer opening physId directly if it's in cameraIdList, else open via logical parent id
-                    if (cameraManager.cameraIdList.contains(physId)) {
-                        rawCandidates.add(physId to null)
-                    } else {
-                        rawCandidates.add(id to physId)
-                    }
+                val pMap = pChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val pRaw = pMap?.getOutputSizes(ImageFormat.RAW_SENSOR)
+                if (pRaw != null && pRaw.isNotEmpty()) {
+                    rawCandidates.add(id to physId)
                 }
             }
         }
+        probeSummary = probeLog.toString().trim()
 
         val parsed = mutableListOf<LensInfo>()
         for ((openId, physId) in rawCandidates) {
@@ -156,9 +172,9 @@ class CameraEngine(private val context: Context) {
                 blInt[0].toFloat(), blInt[1].toFloat(), blInt[2].toFloat(), blInt[3].toFloat()
             )
             val expRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
-                ?: Range(100_000L, 1_000_000_000L)
+                ?: Range(100_000L, 400_000_000L)
             val isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-                ?: Range(50, 3200)
+                ?: Range(100, 3200)
             val orient = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
             val oisModes = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
             val hasOis = oisModes?.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
@@ -185,8 +201,7 @@ class CameraEngine(private val context: Context) {
             )
         }
 
-        // Deduplicate very close lenses and assign clean 0.5x / 1x / 2.7x labels relative to ~24mm main
-        val deduped = parsed.distinctBy { "${it.openId}_${it.physicalId}" }
+        val deduped = parsed.distinctBy { "${it.rawSize.width}x${it.rawSize.height}_${it.focalMm.roundToInt()}" }
             .sortedBy { it.focalMm }
         val mainFocal = deduped.minByOrNull { abs(it.focalMm - 24f) }?.focalMm ?: 24f
 
@@ -308,7 +323,7 @@ class CameraEngine(private val context: Context) {
                 }
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
-                    onError("Camera2 session configure failed on ${lens.label}")
+                    onError("Session config failed on ${lens.label} (id=${lens.openId})")
                 }
             }
         )
@@ -477,135 +492,4 @@ class CameraEngine(private val context: Context) {
         val session = captureSession ?: throw IllegalStateException("Session not ready")
         val rSurface = rawReader?.surface ?: throw IllegalStateException("RAW reader not ready")
         val pSurface = previewSurface ?: throw IllegalStateException("Preview not ready")
-        val lens = currentLens ?: throw IllegalStateException("No lens")
-
-        // Lock current preview AF/AE right before shooting so focus doesn't hunt during burst
-        val baseExp = lastAeExposureNs.coerceIn(lens.exposureRange.lower, lens.exposureRange.upper)
-        val baseIso = lastAeIso.coerceIn(lens.isoRange.lower, lens.isoRange.upper)
-        val totalMeter = baseExp.toDouble() * baseIso.toDouble()
-
-        val lowIso = lens.isoRange.lower
-        val highIso = min(lens.isoRange.upper, max(baseIso * 2, 800))
-
-        // Fast exposure: aim ~1/120s (8.3ms) or 1/4 of baseExp to freeze motion
-        val fastTargetNs = (totalMeter / highIso.toDouble()).toLong()
-        val fastExp = min(8_333_333L, max(lens.exposureRange.lower, fastTargetNs))
-            .coerceIn(lens.exposureRange.lower, lens.exposureRange.upper)
-        val fastIso = (totalMeter / fastExp.toDouble()).roundToInt()
-            .coerceIn(lens.isoRange.lower, lens.isoRange.upper)
-
-        // Long exposure: use low ISO and lengthen shutter cleanly inside MediaTek limits (cap at 1.2s per frame so 6 frames stay snappy!)
-        val maxTripodShutterNs = min(lens.exposureRange.upper, 1_200_000_000L)
-        val idealLongNs = (totalMeter / lowIso.toDouble()).toLong()
-        val longExp = idealLongNs.coerceIn(lens.exposureRange.lower, maxTripodShutterNs)
-        val longIso = (totalMeter / longExp.toDouble()).roundToInt()
-            .coerceIn(lens.isoRange.lower, lens.isoRange.upper)
-
-        val requests = mutableListOf<Pair<CaptureRequest, Int>>()
-
-        fun buildRawReq(expNs: Long, isoVal: Int): CaptureRequest {
-            return cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                addTarget(rSurface)
-                addTarget(pSurface)
-                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
-                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-                set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_FAST)
-                set(CaptureRequest.SENSOR_EXPOSURE_TIME, expNs)
-                set(CaptureRequest.SENSOR_SENSITIVITY, isoVal)
-                set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON)
-                set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF)
-                set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
-                if (lens.hasOis) {
-                    set(
-                        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                        if (oisDisabledOnTripod) CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
-                        else CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
-                    )
-                }
-            }.build()
-        }
-
-        repeat(fastCount) {
-            requests.add(buildRawReq(fastExp, fastIso) to 0)
-        }
-        repeat(longCount) { idx ->
-            // Make 1 long frame slightly darker (-1 EV) to guarantee extra highlight headroom
-            val expThis = if (idx == 0 && longCount >= 3) {
-                (longExp / 2L).coerceIn(lens.exposureRange.lower, lens.exposureRange.upper)
-            } else {
-                longExp
-            }
-            requests.add(buildRawReq(expThis, longIso) to 1)
-        }
-
-        val deferred = CompletableDeferred<List<CapturedRawFrame>>()
-        synchronized(burstLock) {
-            pendingMap.clear()
-            burstCapturedList.clear()
-            burstExpectedCount = requests.size
-            burstDeferred = deferred
-        }
-
-        try {
-            session.stopRepeating()
-        } catch (_: Throwable) {
-        }
-
-        // Capture sequentially so MediaTek RAW16 ImageReader buffers never overflow
-        for ((req, fType) in requests) {
-            val singleDone = CompletableDeferred<Unit>()
-            session.capture(req, object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(
-                    s: CameraCaptureSession,
-                    r: CaptureRequest,
-                    res: TotalCaptureResult
-                ) {
-                    val ts = res.get(CaptureResult.SENSOR_TIMESTAMP) ?: System.nanoTime()
-                    completePairResult(ts, res, fType)
-                    singleDone.complete(Unit)
-                }
-
-                override fun onCaptureFailed(
-                    s: CameraCaptureSession,
-                    r: CaptureRequest,
-                    failure: CaptureFailure
-                ) {
-                    synchronized(burstLock) {
-                        burstExpectedCount = max(0, burstExpectedCount - 1)
-                        if (burstCapturedList.size >= burstExpectedCount) {
-                            burstDeferred?.complete(burstCapturedList.toList())
-                        }
-                    }
-                    singleDone.complete(Unit)
-                }
-            }, bgHandler)
-            singleDone.await()
-        }
-
-        val resultFrames = deferred.await()
-        startPreviewRepeating()
-        return resultFrames
-    }
-
-    fun close() {
-        try {
-            captureSession?.close()
-            captureSession = null
-            cameraDevice?.close()
-            cameraDevice = null
-            rawReader?.close()
-            rawReader = null
-            previewSurface?.release()
-            previewSurface = null
-        } catch (_: Throwable) {
-        }
-    }
-
-    fun shutdown() {
-        close()
-        bgThread.quitSafely()
-        bgExecutor.shutdown()
-    }
-}
+        val lens = currentLens ?: throw IllegalStateException("No

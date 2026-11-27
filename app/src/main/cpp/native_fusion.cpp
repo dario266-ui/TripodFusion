@@ -506,11 +506,11 @@ Java_com_edge_tripodfusion_NativeFusion_processBurst(
 
                 for (int oy = oyStart; oy < oyEnd; ++oy) {
                     float ry = (oy + 0.5f) * invScaleY;
-                    int hy = clampInt((int)(ry * 0.5f), 1, hh - 2);
+                    int hy = clampInt((int)(ry * 0.5f), 2, hh - 3);
 
                     for (int ox = 0; ox < outW; ++ox) {
                         float rx = (ox + 0.5f) * invScaleX;
-                        int hx = clampInt((int)(rx * 0.5f), 1, hw - 2);
+                        int hx = clampInt((int)(rx * 0.5f), 2, hw - 3);
 
                         // Local structure tensor on half-res reference luma
                         float Jxx = 0.0f, Jxy = 0.0f, Jyy = 0.0f;

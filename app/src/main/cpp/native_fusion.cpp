@@ -513,4 +513,4 @@ Java_com_edge_tripodfusion_NativeFusion_processBurst(
     const float invScaleY = (float)roiH / (float)outH;
     const std::vector<float>& refLuma = frames[refIdx].lumaHalf;
     const std::vector<float>& fastLuma = frames[bestFastIdx].lumaHalf;
-    const float shp = clampFloat(sharpenAmoun
+    const float shp = clampFloat(sharpenAmount
